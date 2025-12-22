@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
 from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -145,20 +146,25 @@ print(f"\n[5/8] Creating lagged features and training set...")
 # CREATE LAGS & TRAINING SET
 panel = panel.sort_values(["county_norm", "week_start"])
 
+# Add cyclical date features
+panel['week_of_year'] = panel['week_start'].dt.isocalendar().week
+panel['week_sin'] = np.sin(2 * np.pi * panel['week_of_year']/52.0)
+panel['week_cos'] = np.cos(2 * np.pi * panel['week_of_year']/52.0)
+
 for lag in [1, 2, 3]:
     panel[f"lag{lag}"] = panel.groupby("county_norm")["kamis_smooth"].shift(lag)
 
 # Drop rows with missing lags or missing Agribora price
 panel_train = panel.dropna(subset=["lag1", "lag2", "lag3", "agr_price"]).reset_index(drop=True)
 
-X = panel_train[["kamis_smooth", "lag1", "lag2", "lag3", "county_norm"]]
+X = panel_train[["kamis_smooth", "lag1", "lag2", "lag3", "county_norm", "week_sin", "week_cos"]]
 y = panel_train["agr_price"]
 
 print(f"  - Training samples: {len(X)}")
 
 # UNIFIED SINGLE ML MODEL (ElasticNet)
 print(f"\n[6/8] Training ElasticNet model...")
-numeric_features = ["kamis_smooth", "lag1", "lag2", "lag3"]
+numeric_features = ["kamis_smooth", "lag1", "lag2", "lag3", "week_sin", "week_cos"]
 categorical_features = ["county_norm"]
 
 numeric_transformer = Pipeline(steps=[
@@ -182,14 +188,31 @@ model = Pipeline(steps=[
     ("model", enet)
 ])
 
-model.fit(X, y)
+# TimeSeriesSplit cross-validation
+n_splits = 5
+tscv = TimeSeriesSplit(n_splits=n_splits)
 
-# Inspect training fit quality
-y_pred_train = model.predict(X)
-train_mae = mean_absolute_error(y, y_pred_train)
-train_rmse = np.sqrt(mean_squared_error(y, y_pred_train))
-print(f"  - Train MAE: {train_mae:.2f}")
-print(f"  - Train RMSE: {train_rmse:.2f}")
+mae_scores = []
+rmse_scores = []
+
+for train_index, test_index in tscv.split(X):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+    mae_scores.append(mae)
+    rmse_scores.append(rmse)
+
+print(f"  - TimeSeriesSplit CV MAE: {np.mean(mae_scores):.2f}")
+print(f"  - TimeSeriesSplit CV RMSE: {np.mean(rmse_scores):.2f}")
+
+# Re-train the model on the entire dataset before forecasting
+model.fit(X, y)
 
 # FORECAST FOR TARGET WEEKS
 print(f"\n[7/8] Generating forecasts...")
@@ -225,12 +248,20 @@ for c in target_counties:
 
     while current_week < target_end:
         next_week = current_week + timedelta(days=7)
+
+        # Add cyclical date features for the forecast week
+        week_of_year = next_week.isocalendar().week
+        week_sin = np.sin(2 * np.pi * week_of_year / 52.0)
+        week_cos = np.cos(2 * np.pi * week_of_year / 52.0)
+
         X_h = pd.DataFrame({
             "kamis_smooth": [lag1],
             "lag1": [lag1],
             "lag2": [lag2],
             "lag3": [lag3],
-            "county_norm": [c]
+            "county_norm": [c],
+            "week_sin": [week_sin],
+            "week_cos": [week_cos]
         })
         pred_h = model.predict(X_h)[0]
 
