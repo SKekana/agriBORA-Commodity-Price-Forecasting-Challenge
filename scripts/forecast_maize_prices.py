@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
 from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -175,14 +176,41 @@ preprocess = ColumnTransformer(
     ]
 )
 
-enet = ElasticNet(alpha=0.05, l1_ratio=0.2, random_state=42)
+# Use TimeSeriesSplit for cross-validation
+tscv = TimeSeriesSplit(n_splits=5)
 
-model = Pipeline(steps=[
+# Define the parameter grid for GridSearchCV
+param_grid = {
+    'model__alpha': [0.01, 0.05, 0.1, 0.5, 1.0],
+    'model__l1_ratio': [0.1, 0.2, 0.5, 0.8, 1.0]
+}
+
+enet = ElasticNet(random_state=42)
+
+model_pipeline = Pipeline(steps=[
     ("prep", preprocess),
     ("model", enet)
 ])
 
-model.fit(X, y)
+# Set up GridSearchCV
+grid_search = GridSearchCV(
+    estimator=model_pipeline,
+    param_grid=param_grid,
+    cv=tscv,
+    scoring='neg_mean_squared_error',
+    n_jobs=-1
+)
+
+grid_search.fit(X, y)
+
+# Get the best model
+model = grid_search.best_estimator_
+print(f"  - Best Params: {grid_search.best_params_}")
+
+# Performance metrics
+best_score = grid_search.best_score_
+cv_rmse = np.sqrt(-best_score)
+print(f"  - Cross-validated RMSE: {cv_rmse:.2f}")
 
 # Inspect training fit quality
 y_pred_train = model.predict(X)
