@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
 from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -145,14 +146,17 @@ print(f"\n[5/8] Creating lagged features and training set...")
 # CREATE LAGS & TRAINING SET
 panel = panel.sort_values(["county_norm", "week_start"])
 
+# Calculate week-over-week price difference for the target variable
+panel["agr_price_diff"] = panel.groupby("county_norm")["agr_price"].diff()
+
 for lag in [1, 2, 3]:
     panel[f"lag{lag}"] = panel.groupby("county_norm")["kamis_smooth"].shift(lag)
 
-# Drop rows with missing lags or missing Agribora price
-panel_train = panel.dropna(subset=["lag1", "lag2", "lag3", "agr_price"]).reset_index(drop=True)
+# Drop rows with missing lags or missing Agribora price difference
+panel_train = panel.dropna(subset=["lag1", "lag2", "lag3", "agr_price_diff"]).reset_index(drop=True)
 
 X = panel_train[["kamis_smooth", "lag1", "lag2", "lag3", "county_norm"]]
-y = panel_train["agr_price"]
+y = panel_train["agr_price_diff"]
 
 print(f"  - Training samples: {len(X)}")
 
@@ -182,14 +186,29 @@ model = Pipeline(steps=[
     ("model", enet)
 ])
 
-model.fit(X, y)
+# Time-series cross-validation
+tscv = TimeSeriesSplit(n_splits=5)
+mae_scores = []
+rmse_scores = []
 
-# Inspect training fit quality
-y_pred_train = model.predict(X)
-train_mae = mean_absolute_error(y, y_pred_train)
-train_rmse = np.sqrt(mean_squared_error(y, y_pred_train))
-print(f"  - Train MAE: {train_mae:.2f}")
-print(f"  - Train RMSE: {train_rmse:.2f}")
+for train_index, val_index in tscv.split(X):
+    X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+    y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+
+    model.fit(X_train, y_train)
+    y_pred_val = model.predict(X_val)
+
+    mae = mean_absolute_error(y_val, y_pred_val)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred_val))
+    mae_scores.append(mae)
+    rmse_scores.append(rmse)
+
+print(f"  - Cross-Validation MAE: {np.mean(mae_scores):.2f}")
+print(f"  - Cross-Validation RMSE: {np.mean(rmse_scores):.2f}")
+
+# Refit the model on the entire dataset
+print("  - Refitting model on all available data...")
+model.fit(X, y)
 
 # FORECAST FOR TARGET WEEKS
 print(f"\n[7/8] Generating forecasts...")
@@ -210,39 +229,54 @@ for c in target_counties:
     if hist.empty:
         continue
 
-    last3 = hist["kamis_smooth"].tail(3).values
-    if len(last3) == 1:
-        lag1 = lag2 = lag3 = last3[-1]
-    elif len(last3) == 2:
-        lag1 = last3[-1]
-        lag2 = lag3 = last3[-2]
+    # Find the last valid price for the county
+    valid_prices = hist["agr_price"].dropna()
+    if valid_prices.empty:
+        print(f"  - WARNING: No historical agriBORA price for {c}. Skipping forecast.")
+        continue
+
+    # Get the last known absolute price to anchor the forecast
+    last_known_price = valid_prices.iloc[-1]
+
+    # Initialize lags from kamis_smooth for external feature consistency
+    kamis_lags = hist["kamis_smooth"].tail(3).values
+    if len(kamis_lags) == 1:
+        lag1 = lag2 = lag3 = kamis_lags[-1]
+    elif len(kamis_lags) == 2:
+        lag1 = kamis_lags[-1]
+        lag2 = lag3 = kamis_lags[-2]
     else:
-        lag1 = last3[-1]
-        lag2 = last3[-2]
-        lag3 = last3[-3]
+        lag1 = kamis_lags[-1]
+        lag2 = kamis_lags[-2]
+        lag3 = kamis_lags[-3]
 
     current_week = global_last_week
+    current_price = last_known_price
 
     while current_week < target_end:
         next_week = current_week + timedelta(days=7)
         X_h = pd.DataFrame({
-            "kamis_smooth": [lag1],
+            "kamis_smooth": [lag1], # Using kamis_smooth as placeholder for external feature
             "lag1": [lag1],
             "lag2": [lag2],
             "lag3": [lag3],
             "county_norm": [c]
         })
-        pred_h = model.predict(X_h)[0]
+
+        # Predict the price *difference*
+        pred_diff = model.predict(X_h)[0]
+
+        # Add the difference to the current price to get the new absolute price
+        current_price += pred_diff
 
         forecast_rows.append({
             "county": c,
             "week_start": next_week,
-            "agr_pred": pred_h
+            "agr_pred": current_price
         })
 
-        lag3 = lag2
-        lag2 = lag1
-        lag1 = pred_h
+        # The external features (kamis_smooth lags) are held constant at their last known values
+        # for the forecast period. This results in a constant predicted difference and a linear forecast trend.
         current_week = next_week
 
 forecast_df = pd.DataFrame(forecast_rows)
