@@ -12,11 +12,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
 from sklearn.linear_model import ElasticNet
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, PolynomialFeatures
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -157,42 +158,67 @@ y = panel_train["agr_price"]
 print(f"  - Training samples: {len(X)}")
 
 # UNIFIED SINGLE ML MODEL (ElasticNet)
-print(f"\n[6/8] Training ElasticNet model...")
+print(f"\n[6/8] Training ElasticNet model with interaction features...")
 numeric_features = ["kamis_smooth", "lag1", "lag2", "lag3"]
 categorical_features = ["county_norm"]
 
+# Preprocessing pipeline
 numeric_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="median")),
     ("scaler", StandardScaler())
 ])
-
 categorical_transformer = OneHotEncoder(handle_unknown="ignore")
 
-preprocess = ColumnTransformer(
+# Column transformer for initial feature processing
+preprocessor = ColumnTransformer(
     transformers=[
         ("num", numeric_transformer, numeric_features),
         ("cat", categorical_transformer, categorical_features),
-    ]
+    ],
+    remainder="passthrough"  # Keep other columns if any
 )
 
+# Interaction features pipeline
+poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)
+
+# ElasticNet model
 enet = ElasticNet(alpha=0.05, l1_ratio=0.2, random_state=42)
 
+# Full model pipeline
 model = Pipeline(steps=[
-    ("prep", preprocess),
+    ("preprocessing", preprocessor),
+    ("interactions", poly),
     ("model", enet)
 ])
 
+# TimeSeriesSplit cross-validation
+n_splits = 5
+tscv = TimeSeriesSplit(n_splits=n_splits)
+mae_scores = []
+rmse_scores = []
+
+print(f"  - Performing {n_splits}-fold Time Series Cross-Validation...")
+for i, (train_index, test_index) in enumerate(tscv.split(X)):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae_scores.append(mae)
+    rmse_scores.append(rmse)
+    print(f"    - Fold {i+1}/{n_splits} -> MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+
+print(f"\n  - Average CV MAE: {np.mean(mae_scores):.2f}")
+print(f"  - Average CV RMSE: {np.mean(rmse_scores):.2f}")
+
+print("\n[7/8] Retraining final model on all data...")
 model.fit(X, y)
 
-# Inspect training fit quality
-y_pred_train = model.predict(X)
-train_mae = mean_absolute_error(y, y_pred_train)
-train_rmse = np.sqrt(mean_squared_error(y, y_pred_train))
-print(f"  - Train MAE: {train_mae:.2f}")
-print(f"  - Train RMSE: {train_rmse:.2f}")
-
 # FORECAST FOR TARGET WEEKS
-print(f"\n[7/8] Generating forecasts...")
+print(f"\n[8/8] Generating forecasts...")
 panel_five = panel[panel["county_norm"].isin(target_counties)].copy()
 panel_five = panel_five.sort_values(["county_norm", "week_start"])
 
