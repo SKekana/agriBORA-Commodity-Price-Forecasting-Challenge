@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
-from sklearn.linear_model import ElasticNet
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -175,11 +175,11 @@ preprocess = ColumnTransformer(
     ]
 )
 
-enet = ElasticNet(alpha=0.05, l1_ratio=0.2, random_state=42)
+rf = RandomForestRegressor(n_estimators=100, random_state=42)
 
 model = Pipeline(steps=[
     ("prep", preprocess),
-    ("model", enet)
+    ("model", rf)
 ])
 
 model.fit(X, y)
