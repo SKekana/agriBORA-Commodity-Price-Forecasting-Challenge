@@ -11,7 +11,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
-from sklearn.linear_model import ElasticNet
+import xgboost as xgb
+from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -156,8 +157,8 @@ y = panel_train["agr_price"]
 
 print(f"  - Training samples: {len(X)}")
 
-# UNIFIED SINGLE ML MODEL (ElasticNet)
-print(f"\n[6/8] Training ElasticNet model...")
+# GRADIENT BOOSTING MODEL (XGBoost)
+print(f"\n[6/8] Training Gradient Boosting model with GridSearchCV...")
 numeric_features = ["kamis_smooth", "lag1", "lag2", "lag3"]
 categorical_features = ["county_norm"]
 
@@ -175,16 +176,39 @@ preprocess = ColumnTransformer(
     ]
 )
 
-enet = ElasticNet(alpha=0.05, l1_ratio=0.2, random_state=42)
+# Define the XGBoost model pipeline
+xgb_model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
 
-model = Pipeline(steps=[
+model_pipeline = Pipeline(steps=[
     ("prep", preprocess),
-    ("model", enet)
+    ("model", xgb_model)
 ])
 
-model.fit(X, y)
+# Define the parameter grid for GridSearchCV
+param_grid = {
+    'model__n_estimators': [100, 200],
+    'model__max_depth': [3, 5],
+    'model__learning_rate': [0.1, 0.2],
+    'model__reg_alpha': [0, 0.1]
+}
 
-# Inspect training fit quality
+# Create and fit GridSearchCV
+grid_search = GridSearchCV(
+    model_pipeline,
+    param_grid,
+    cv=3,
+    scoring='neg_mean_squared_error',
+    verbose=1,
+    n_jobs=-1
+)
+
+grid_search.fit(X, y)
+
+# Best model
+model = grid_search.best_estimator_
+print(f"\nBest parameters found: {grid_search.best_params_}")
+
+# Inspect training fit quality (using the best model from grid search)
 y_pred_train = model.predict(X)
 train_mae = mean_absolute_error(y, y_pred_train)
 train_rmse = np.sqrt(mean_squared_error(y, y_pred_train))
