@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
 from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -148,19 +149,33 @@ panel = panel.sort_values(["county_norm", "week_start"])
 for lag in [1, 2, 3]:
     panel[f"lag{lag}"] = panel.groupby("county_norm")["kamis_smooth"].shift(lag)
 
+# Add rolling statistics features
+windows = [3, 6, 12]
+for w in windows:
+    panel[f'rolling_std_{w}'] = panel.groupby('county_norm')['kamis_smooth'].rolling(window=w, min_periods=1).std().reset_index(level=0, drop=True)
+    panel[f'rolling_min_{w}'] = panel.groupby('county_norm')['kamis_smooth'].rolling(window=w, min_periods=1).min().reset_index(level=0, drop=True)
+    panel[f'rolling_max_{w}'] = panel.groupby('county_norm')['kamis_smooth'].rolling(window=w, min_periods=1).max().reset_index(level=0, drop=True)
+
+# Fill NaNs created by rolling std
+for w in windows:
+    panel[f'rolling_std_{w}'] = panel[f'rolling_std_{w}'].bfill().ffill()
+
 # Drop rows with missing lags or missing Agribora price
 panel_train = panel.dropna(subset=["lag1", "lag2", "lag3", "agr_price"]).reset_index(drop=True)
 
-X = panel_train[["kamis_smooth", "lag1", "lag2", "lag3", "county_norm"]]
+# Define feature columns
+numeric_features = ["kamis_smooth", "lag1", "lag2", "lag3"]
+rolling_features = [f'rolling_{stat}_{w}' for w in [3, 6, 12] for stat in ['std', 'min', 'max']]
+numeric_features.extend(rolling_features)
+categorical_features = ["county_norm"]
+
+X = panel_train[numeric_features + categorical_features]
 y = panel_train["agr_price"]
 
 print(f"  - Training samples: {len(X)}")
 
 # UNIFIED SINGLE ML MODEL (ElasticNet)
 print(f"\n[6/8] Training ElasticNet model...")
-numeric_features = ["kamis_smooth", "lag1", "lag2", "lag3"]
-categorical_features = ["county_norm"]
-
 numeric_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="median")),
     ("scaler", StandardScaler())
@@ -182,14 +197,29 @@ model = Pipeline(steps=[
     ("model", enet)
 ])
 
-model.fit(X, y)
+# TimeSeriesSplit cross-validation
+tscv = TimeSeriesSplit(n_splits=5)
+mae_scores = []
+rmse_scores = []
 
-# Inspect training fit quality
-y_pred_train = model.predict(X)
-train_mae = mean_absolute_error(y, y_pred_train)
-train_rmse = np.sqrt(mean_squared_error(y, y_pred_train))
-print(f"  - Train MAE: {train_mae:.2f}")
-print(f"  - Train RMSE: {train_rmse:.2f}")
+for train_index, val_index in tscv.split(X):
+    X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+    y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+
+    model.fit(X_train, y_train)
+    y_pred_val = model.predict(X_val)
+
+    mae = mean_absolute_error(y_val, y_pred_val)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred_val))
+
+    mae_scores.append(mae)
+    rmse_scores.append(rmse)
+
+print(f"  - CV Mean MAE: {np.mean(mae_scores):.2f}")
+print(f"  - CV Mean RMSE: {np.mean(rmse_scores):.2f}")
+
+# Refit model on the entire training data before forecasting
+model.fit(X, y)
 
 # FORECAST FOR TARGET WEEKS
 print(f"\n[7/8] Generating forecasts...")
@@ -223,15 +253,32 @@ for c in target_counties:
 
     current_week = global_last_week
 
+    # History for recursive feature generation
+    kamis_history = hist["kamis_smooth"].tolist()
+
     while current_week < target_end:
         next_week = current_week + timedelta(days=7)
+
+        # Calculate rolling features on the current history
+        hist_series = pd.Series(kamis_history)
+        rolling_features_payload = {}
+        for w in [3, 6, 12]:
+            # Use min_periods=1 and ffill/fillna to match training logic without data leakage
+            rolling_std = hist_series.rolling(window=w, min_periods=1).std().ffill().fillna(0)
+            rolling_features_payload[f'rolling_std_{w}'] = [rolling_std.iloc[-1]]
+            rolling_features_payload[f'rolling_min_{w}'] = [hist_series.rolling(window=w, min_periods=1).min().iloc[-1]]
+            rolling_features_payload[f'rolling_max_{w}'] = [hist_series.rolling(window=w, min_periods=1).max().iloc[-1]]
+
+        # Create prediction row
         X_h = pd.DataFrame({
             "kamis_smooth": [lag1],
             "lag1": [lag1],
             "lag2": [lag2],
             "lag3": [lag3],
-            "county_norm": [c]
+            "county_norm": [c],
+            **rolling_features_payload
         })
+
         pred_h = model.predict(X_h)[0]
 
         forecast_rows.append({
@@ -240,9 +287,11 @@ for c in target_counties:
             "agr_pred": pred_h
         })
 
+        # Update lags and history for next iteration
         lag3 = lag2
         lag2 = lag1
         lag1 = pred_h
+        kamis_history.append(pred_h)
         current_week = next_week
 
 forecast_df = pd.DataFrame(forecast_rows)
